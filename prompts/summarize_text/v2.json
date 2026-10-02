@@ -1,0 +1,7 @@
+{
+  "template": "Write a summary of the following text. The summary must be between 30 and 45 words long, written in plain prose. Do not begin with a preamble such as 'This text discusses' or 'The article describes'. Do not use bullet points, numbered lists, or quotation marks. Keep the main subject and the single most important fact or figure from the original.\n\nText:\n{input_text}\n\nSummary:",
+  "changelog": "Tighter word-count window (30-45), lower temperature for consistency, explicit ban on preamble, bullets and quotes.",
+  "model_parameters": {
+    "temperature": 0.2
+  }
+}

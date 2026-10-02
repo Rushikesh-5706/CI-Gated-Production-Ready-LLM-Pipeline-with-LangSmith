@@ -1,0 +1,7 @@
+{
+  "template": "Extract the names of people, calendar dates, and locations from the text below. Return the result as a JSON object with keys \"names\", \"dates\", and \"locations\", each containing an array of strings.\n\nText:\n{input_text}",
+  "changelog": "Initial entity extraction prompt with minimal instructions.",
+  "model_parameters": {
+    "temperature": 0.3
+  }
+}

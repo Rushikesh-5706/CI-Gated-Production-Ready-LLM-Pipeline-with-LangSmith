@@ -1,0 +1,7 @@
+{
+  "template": "Summarize the following text in less than 50 words: {input_text}",
+  "changelog": "Initial version of the summarization prompt.",
+  "model_parameters": {
+    "temperature": 0.7
+  }
+}
