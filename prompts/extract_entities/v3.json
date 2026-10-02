@@ -1,0 +1,8 @@
+{
+    "model_parameters": {
+        "temperature": 0.0,
+        "max_tokens": 512
+    },
+    "template": "Extract entities from this text: {input_text}. Return them as a flat comma separated list of names. Do not use JSON.",
+    "changelog": "regression test prompt that intentionally breaks schema"
+}
