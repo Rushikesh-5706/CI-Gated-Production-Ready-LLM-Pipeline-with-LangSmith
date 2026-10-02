@@ -1,0 +1,76 @@
+name: LLM Regression
+
+"on":
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: llm-regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: LLM Regression Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      LANGCHAIN_TRACING_V2: "true"
+      LANGCHAIN_PROJECT: ci-gated-llm-pipeline-ci
+      EVAL_ENVIRONMENT: ci
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      LANGCHAIN_API_KEY: ${{ secrets.LANGCHAIN_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Verify secrets
+        run: |
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "::error::GROQ_API_KEY secret is not set"
+            exit 1
+          fi
+          if [ -z "$LANGCHAIN_API_KEY" ]; then
+            echo "::error::LANGCHAIN_API_KEY secret is not set"
+            exit 1
+          fi
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Run evaluation
+        id: evaluate
+        run: python -m evaluation.run_regression --output-dir results
+
+      - name: Post PR comment
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python -c "from evaluation.pr_comment import upsert_comment; from pathlib import Path; r=Path('results/report.md'); upsert_comment(r.read_text() if r.exists() else 'Evaluation failed to produce a report. Check the workflow run logs.')"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results
+          path: results/
