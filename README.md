@@ -58,3 +58,6 @@ To test new prompt versions against the baseline dataset:
 python3 -m evaluation.run_regression --output-dir results
 ```
 This outputs a `results/report.md` detailing pass/fail thresholds, LLM judge scores, and exact token costs. This script is run automatically on every Pull Request to `main`.
+
+## Regression Demonstration
+To see the CI gate in action, view the active Pull Request from the `regression-demo` branch, which introduces an intentionally degraded prompt (`v3`) that fails the JSON schema extraction evaluation and gets blocked from merging.
