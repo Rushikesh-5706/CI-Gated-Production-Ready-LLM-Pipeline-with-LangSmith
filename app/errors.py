@@ -30,3 +30,7 @@ class LLMTimeoutError(PipelineError):
 
 class LLMUpstreamError(PipelineError):
     pass
+
+
+class LLMEmptyResponseError(PipelineError):
+    pass
