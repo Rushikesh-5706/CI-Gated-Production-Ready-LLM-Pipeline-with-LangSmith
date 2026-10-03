@@ -26,6 +26,10 @@ def build_report(
         for reason in failed_reasons:
             lines.append(f"  - {reason}")
 
+    sample_size = results.get("sample_size", 0)
+    if sample_size and sample_size > 0:
+        lines.append(f"  (sampled {sample_size} examples per dataset)")
+
     lines.append("")
     lines.append("## Metrics")
     lines.append("")
@@ -48,7 +52,7 @@ def build_report(
                 baseline_val = f"{bval:.3f}"
                 delta = f"{value - bval:+.3f}"
 
-        threshold_str = f"{threshold}" if threshold else ""
+        threshold_str = str(threshold) if threshold else ""
         status = entry.get("status", "")
         lines.append(
             f"| {prompt} | {version} | {metric} | {value:.3f} | "
@@ -58,25 +62,38 @@ def build_report(
     lines.append("")
     lines.append("## Example Counts")
     lines.append("")
-    lines.append("| Dataset | Expected | Scored |")
-    lines.append("|---------|----------|--------|")
+    lines.append("| Dataset | Expected | Scored | Complete |")
+    lines.append("|---------|----------|--------|----------|")
     for ds in results.get("datasets", []):
-        lines.append(f"| {ds['name']} | {ds['expected']} | {ds['scored']} |")
+        exp = ds["expected"]
+        scored = ds["scored"]
+        pct = f"{100 * scored / exp:.1f}%" if exp > 0 else "n/a"
+        lines.append(f"| {ds['name']} | {exp} | {scored} | {pct} |")
 
     lines.append("")
     lines.append("## Token Usage and Cost Estimate")
     lines.append("")
-    lines.append("| Model | Prompt Tokens | Completion Tokens | Total Tokens | Est. Cost (USD) |")
-    lines.append("|-------|---------------|-------------------|--------------|-----------------|")
+    lines.append(
+        "| Model | Prompt Tokens | Completion Tokens | Total Tokens | Est. Cost (USD) |"
+    )
+    lines.append(
+        "|-------|---------------|-------------------|--------------|-----------------|"
+    )
+    total_cost = costs.get("total", 0.0)
     for model, counts in usage_by_model.items():
         cost = costs.get(model, 0.0)
+        # Mark as unpriced when no pricing entry exists.
+        cost_str = "unpriced" if costs.get(f"{model}_unpriced") is not None else f"${cost:.6f}"
         lines.append(
             f"| {model} | {counts['prompt_tokens']} | {counts['completion_tokens']} | "
-            f"{counts['total_tokens']} | ${cost:.6f} |"
+            f"{counts['total_tokens']} | {cost_str} |"
         )
-    lines.append(f"| **Total** | | | | **${costs.get('total', 0.0):.6f}** |")
+    lines.append(f"| **Total** | | | | **${total_cost:.6f}** |")
     lines.append("")
-    lines.append("Costs are estimates at list prices. The Groq free tier incurs no charge.")
+    lines.append(
+        "Rates sourced from https://groq.com/pricing as of 2026-10-03. "
+        "The Groq free tier incurs no charge."
+    )
 
     lines.append("")
     lines.append("## Run Details")
@@ -88,14 +105,25 @@ def build_report(
     if workflow_url and repo and run_id:
         lines.append(f"- Workflow run: {workflow_url}/{repo}/actions/runs/{run_id}")
     for name, url in experiment_urls.items():
-        lines.append(f"- Experiment ({name}): {url}")
+        if url:
+            lines.append(f"- Experiment ({name}): {url}")
 
     if failing_examples:
         lines.append("")
         lines.append("## Failing Examples (up to 10)")
         lines.append("")
-        for fe in failing_examples[:10]:
-            lines.append(f"- **{fe['evaluator']}** on `{fe['dataset']}`: {fe['comment']}")
+        lines.append("| # | Evaluator | Dataset | Example ID | Input Snippet | Score | Comment |")
+        lines.append("|---|-----------|---------|------------|---------------|-------|---------|")
+        sorted_failures = sorted(failing_examples, key=lambda x: x.get("score", 0))
+        for i, fe in enumerate(sorted_failures[:10], 1):
+            snippet = str(fe.get("input_snippet", ""))[:60].replace("|", "\\|")
+            comment = str(fe.get("comment", ""))[:80].replace("|", "\\|")
+            ex_id = str(fe.get("example_id", ""))[:16]
+            score = fe.get("score", "")
+            lines.append(
+                f"| {i} | {fe['evaluator']} | {fe['dataset']} | "
+                f"{ex_id} | {snippet} | {score} | {comment} |"
+            )
 
     lines.append("")
     return "\n".join(lines)
@@ -116,6 +144,8 @@ def load_baseline(path: Path) -> dict | None:
 def save_baseline(path: Path, results: dict) -> None:
     baseline = {}
     for entry in results.get("metrics", []):
+        if entry.get("status") == "INFO":
+            continue
         bkey = f"{entry['prompt']}_{entry['metric']}"
         baseline[bkey] = entry["value"]
     path.write_text(json.dumps(baseline, indent=2) + "\n")

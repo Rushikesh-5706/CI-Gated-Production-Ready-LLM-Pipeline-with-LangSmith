@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -13,7 +14,12 @@ from app import config, registry
 from app.llm import set_usage_callback
 from app.pipeline import execute
 from evaluation import config as eval_config
-from evaluation.evaluators import json_schema_validity, summary_length_bounds
+from evaluation.evaluators import (
+    entity_match_f1,
+    json_schema_validity,
+    summary_length_bounds,
+)
+from evaluation.gate import evaluate_gate
 from evaluation.judge import llm_as_judge_quality
 from evaluation.pricing import estimate_total
 from evaluation.report import build_report, load_baseline, save_baseline, write_results
@@ -24,7 +30,9 @@ log = logging.getLogger(__name__)
 
 def _git_sha() -> str:
     try:
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True
+        ).strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return os.environ.get("GITHUB_SHA", "unknown")[:8]
 
@@ -43,7 +51,7 @@ def _make_target(prompt_name: str, prompt_version: str, environment: str):
             )
             rt.add_tags([prompt_name, prompt_version, environment])
 
-        result = execute(prompt_name, prompt_version, input_text, environment)
+        result = execute(prompt_name, prompt_version, input_text)
         return {"output": result.output}
 
     return target
@@ -57,6 +65,33 @@ def _find_latest_version(prompt_name: str) -> str:
     return v
 
 
+def _get_experiment_url(ls_client: Client, results_obj) -> str:
+    """Reliably extract the LangSmith experiment URL from an evaluate() result."""
+    # Prefer a direct attribute.
+    for attr in ("experiment_url", "url"):
+        url = getattr(results_obj, attr, None)
+        if url:
+            return url
+    # Fall back to reading the project by experiment_name.
+    exp_name = getattr(results_obj, "experiment_name", None)
+    if exp_name:
+        try:
+            project = ls_client.read_project(project_name=exp_name)
+            url = getattr(project, "url", None) or ""
+            if url:
+                return url
+        except Exception as exc:
+            log.debug("could not read project %r: %s", exp_name, exc)
+    return ""
+
+
+def _sample_examples(examples: list, size: int) -> list:
+    if size <= 0 or size >= len(examples):
+        return examples
+    rng = random.Random(42)
+    return rng.sample(examples, size)
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -66,7 +101,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--summarize-version", default=None)
     parser.add_argument("--extract-version", default=None)
-    parser.add_argument("--sample-size", type=int, default=config.EVAL_SAMPLE_SIZE)
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=config.EVAL_SAMPLE_SIZE,
+        help="number of examples to sample per dataset; 0 means all",
+    )
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--update-baseline", action="store_true")
     args = parser.parse_args()
@@ -82,7 +122,7 @@ def main():
         eval_config.SUMMARIZATION_DATASET: None,
         eval_config.EXTRACTION_DATASET: None,
     }
-    for ds_name in datasets:
+    for ds_name in list(datasets):
         try:
             ds = client.read_dataset(dataset_name=ds_name)
             datasets[ds_name] = ds
@@ -90,13 +130,35 @@ def main():
             print(f"dataset '{ds_name}' not found: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    for ds_name, ds in datasets.items():
-        examples = list(client.list_examples(dataset_id=ds.id))
-        count = len(examples)
-        if count < 25:
-            print(f"dataset '{ds_name}' has {count} examples, need at least 25", file=sys.stderr)
+    sum_examples_all = list(client.list_examples(dataset_id=datasets[eval_config.SUMMARIZATION_DATASET].id))
+    ext_examples_all = list(client.list_examples(dataset_id=datasets[eval_config.EXTRACTION_DATASET].id))
+
+    for ds_name, examples in [
+        (eval_config.SUMMARIZATION_DATASET, sum_examples_all),
+        (eval_config.EXTRACTION_DATASET, ext_examples_all),
+    ]:
+        if len(examples) < 25:
+            print(
+                f"dataset '{ds_name}' has {len(examples)} examples, need at least 25",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        log.info("dataset '%s' has %d examples", ds_name, count)
+        log.info("dataset '%s' has %d examples", ds_name, len(examples))
+
+    sum_examples = _sample_examples(sum_examples_all, args.sample_size)
+    ext_examples = _sample_examples(ext_examples_all, args.sample_size)
+
+    sample_note = (
+        f" (sampled {args.sample_size} of {len(sum_examples_all)})"
+        if args.sample_size > 0
+        else ""
+    )
+    log.info(
+        "using %d summarization and %d extraction examples%s",
+        len(sum_examples),
+        len(ext_examples),
+        sample_note,
+    )
 
     git_sha = _git_sha()
     environment = config.EVAL_ENVIRONMENT
@@ -104,12 +166,10 @@ def main():
     accumulator = start_accumulator()
     set_usage_callback(accumulator.record)
 
-    all_metrics = []
-    all_datasets_info = []
-    experiment_urls = {}
-    failing_examples = []
-    gate_pass = True
-    failed_reasons = []
+    all_metrics: list[dict] = []
+    all_datasets_info: list[dict] = []
+    experiment_urls: dict[str, str] = {}
+    failing_examples: list[dict] = []
 
     # -- Summarization --
     sum_prefix = f"ci-summarize_text-{sum_version}-{git_sha}"
@@ -118,22 +178,34 @@ def main():
     log.info("running summarization evaluation with %s", sum_version)
     sum_results = evaluate(
         sum_target,
-        data=eval_config.SUMMARIZATION_DATASET,
+        data=sum_examples,
         evaluators=[summary_length_bounds, llm_as_judge_quality],
         experiment_prefix=sum_prefix,
         max_concurrency=config.EVAL_MAX_CONCURRENCY,
         metadata={"git_sha": git_sha, "prompt_version": sum_version},
     )
 
-    length_scores = []
-    judge_scores = []
+    length_scores: list[float] = []
+    judge_scores: list[float] = []
+    # Track completeness: each example is complete only if both evaluators scored.
     sum_scored = 0
-    sum_expected = 0
+    sum_expected = len(sum_examples)
 
     for result in sum_results:
-        sum_expected += 1
         eval_results = result.get("evaluation_results", {})
-        results_list = eval_results.get("results", []) if isinstance(eval_results, dict) else []
+        results_list = (
+            eval_results.get("results", []) if isinstance(eval_results, dict) else []
+        )
+
+        length_scored = False
+        judge_scored = False
+        example_input = result.get("example")
+        if example_input:
+            input_snippet = str(getattr(example_input, "inputs", {}).get("input_text", ""))[:60]
+            example_id = str(getattr(example_input, "id", "unknown"))[:16]
+        else:
+            input_snippet = ""
+            example_id = "unknown"
 
         for er in results_list:
             key = getattr(er, "key", "")
@@ -142,19 +214,36 @@ def main():
                 continue
 
             if key == eval_config.EVALUATOR_LENGTH:
-                length_scores.append(score)
-            elif key == eval_config.EVALUATOR_JUDGE:
-                judge_scores.append(score)
+                length_scores.append(float(score))
+                length_scored = True
                 if score == 0:
                     failing_examples.append(
                         {
                             "evaluator": key,
                             "dataset": eval_config.SUMMARIZATION_DATASET,
+                            "example_id": example_id,
+                            "input_snippet": input_snippet,
+                            "score": score,
+                            "comment": getattr(er, "comment", ""),
+                        }
+                    )
+            elif key == eval_config.EVALUATOR_JUDGE:
+                judge_scores.append(float(score))
+                judge_scored = True
+                if score < eval_config.JUDGE_MEAN_MIN:
+                    failing_examples.append(
+                        {
+                            "evaluator": key,
+                            "dataset": eval_config.SUMMARIZATION_DATASET,
+                            "example_id": example_id,
+                            "input_snippet": input_snippet,
+                            "score": score,
                             "comment": getattr(er, "comment", ""),
                         }
                     )
 
-        sum_scored += 1
+        if length_scored and judge_scored:
+            sum_scored += 1
 
     length_pass_rate = sum(length_scores) / len(length_scores) if length_scores else 0.0
     judge_mean = sum(judge_scores) / len(judge_scores) if judge_scores else 0.0
@@ -180,12 +269,6 @@ def main():
         }
     )
 
-    if judge_mean < eval_config.JUDGE_MEAN_MIN:
-        gate_pass = False
-        failed_reasons.append(
-            f"summarize_text {eval_config.EVALUATOR_JUDGE} mean {judge_mean:.3f} < {eval_config.JUDGE_MEAN_MIN}"
-        )
-
     all_datasets_info.append(
         {
             "name": eval_config.SUMMARIZATION_DATASET,
@@ -193,12 +276,7 @@ def main():
             "scored": sum_scored,
         }
     )
-
-    try:
-        exp_url = sum_results.experiment_url if hasattr(sum_results, "experiment_url") else ""
-        experiment_urls["summarize_text"] = exp_url or ""
-    except Exception:
-        experiment_urls["summarize_text"] = ""
+    experiment_urls["summarize_text"] = _get_experiment_url(client, sum_results)
 
     # -- Extraction --
     ext_prefix = f"ci-extract_entities-{ext_version}-{git_sha}"
@@ -207,21 +285,33 @@ def main():
     log.info("running extraction evaluation with %s", ext_version)
     ext_results = evaluate(
         ext_target,
-        data=eval_config.EXTRACTION_DATASET,
-        evaluators=[json_schema_validity],
+        data=ext_examples,
+        evaluators=[json_schema_validity, entity_match_f1],
         experiment_prefix=ext_prefix,
         max_concurrency=config.EVAL_MAX_CONCURRENCY,
         metadata={"git_sha": git_sha, "prompt_version": ext_version},
     )
 
-    validity_scores = []
+    validity_scores: list[float] = []
+    f1_scores: list[float] = []
     ext_scored = 0
-    ext_expected = 0
+    ext_expected = len(ext_examples)
 
     for result in ext_results:
-        ext_expected += 1
         eval_results = result.get("evaluation_results", {})
-        results_list = eval_results.get("results", []) if isinstance(eval_results, dict) else []
+        results_list = (
+            eval_results.get("results", []) if isinstance(eval_results, dict) else []
+        )
+
+        validity_scored = False
+        f1_scored = False
+        example_input = result.get("example")
+        if example_input:
+            input_snippet = str(getattr(example_input, "inputs", {}).get("input_text", ""))[:60]
+            example_id = str(getattr(example_input, "id", "unknown"))[:16]
+        else:
+            input_snippet = ""
+            example_id = "unknown"
 
         for er in results_list:
             key = getattr(er, "key", "")
@@ -230,19 +320,30 @@ def main():
                 continue
 
             if key == eval_config.EVALUATOR_JSON_SCHEMA:
-                validity_scores.append(score)
+                validity_scores.append(float(score))
+                validity_scored = True
                 if score == 0:
                     failing_examples.append(
                         {
                             "evaluator": key,
                             "dataset": eval_config.EXTRACTION_DATASET,
+                            "example_id": example_id,
+                            "input_snippet": input_snippet,
+                            "score": score,
                             "comment": getattr(er, "comment", ""),
                         }
                     )
+            elif key == "entity_match_f1":
+                f1_scores.append(float(score))
+                f1_scored = True
 
-        ext_scored += 1
+        if validity_scored and f1_scored:
+            ext_scored += 1
 
-    validity_rate = sum(validity_scores) / len(validity_scores) if validity_scores else 0.0
+    validity_rate = (
+        sum(validity_scores) / len(validity_scores) if validity_scores else 0.0
+    )
+    f1_mean = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
 
     all_metrics.append(
         {
@@ -254,12 +355,16 @@ def main():
             "status": "PASS" if validity_rate >= eval_config.JSON_VALIDITY_MIN else "FAIL",
         }
     )
-
-    if validity_rate < eval_config.JSON_VALIDITY_MIN:
-        gate_pass = False
-        failed_reasons.append(
-            f"extract_entities {eval_config.EVALUATOR_JSON_SCHEMA} rate {validity_rate:.3f} < {eval_config.JSON_VALIDITY_MIN}"
-        )
+    all_metrics.append(
+        {
+            "prompt": "extract_entities",
+            "version": ext_version,
+            "metric": "entity_match_f1",
+            "value": f1_mean,
+            "threshold": "informational",
+            "status": "INFO",
+        }
+    )
 
     all_datasets_info.append(
         {
@@ -268,14 +373,20 @@ def main():
             "scored": ext_scored,
         }
     )
+    experiment_urls["extract_entities"] = _get_experiment_url(client, ext_results)
 
-    try:
-        exp_url = ext_results.experiment_url if hasattr(ext_results, "experiment_url") else ""
-        experiment_urls["extract_entities"] = exp_url or ""
-    except Exception:
-        experiment_urls["extract_entities"] = ""
+    # -- Gate --
+    total_scored = sum_scored + ext_scored
+    total_expected = sum_expected + ext_expected
 
-    # -- finalize --
+    gate = evaluate_gate(
+        json_validity=validity_rate if validity_scores else None,
+        judge_mean=judge_mean if judge_scores else None,
+        scored=total_scored,
+        total=total_expected,
+    )
+
+    # -- Finalize --
     acc = stop_accumulator()
     set_usage_callback(None)
     usage_by_model = acc.totals() if acc else {}
@@ -285,10 +396,11 @@ def main():
     baseline = load_baseline(baseline_path)
 
     results_dict = {
-        "gate_pass": gate_pass,
-        "failed_reasons": failed_reasons,
+        "gate_pass": gate.passed,
+        "failed_reasons": gate.reasons,
         "metrics": all_metrics,
         "datasets": all_datasets_info,
+        "sample_size": args.sample_size,
     }
 
     report = build_report(
@@ -307,13 +419,13 @@ def main():
     print(report)
 
     if args.update_baseline:
-        if not gate_pass:
+        if not gate.passed:
             print("gate failed; refusing to update baseline", file=sys.stderr)
             sys.exit(1)
         save_baseline(baseline_path, results_dict)
         print(f"baseline updated at {baseline_path}")
 
-    if not gate_pass:
+    if not gate.passed:
         sys.exit(1)
 
 
