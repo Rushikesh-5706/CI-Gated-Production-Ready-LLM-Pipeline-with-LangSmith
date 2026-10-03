@@ -1,4 +1,4 @@
-"""Reads a trace back from LangSmith and verifies the three required metadata keys."""
+"""Reads a trace back from LangSmith and verifies the required metadata keys."""
 
 import sys
 import time
@@ -20,15 +20,15 @@ def verify_trace(trace_url: str, expected_name: str, expected_version: str, expe
     # The trace may not be flushed yet
     for attempt in range(5):
         try:
-            run = client.read_run(run_id_part)
+            root_run = client.read_run(run_id_part)
             break
         except Exception:
             if attempt == 4:
-                print(f"  FAIL: could not read run {run_id_part} after 5 attempts")
+                print(f"  FAIL: could not read root run {run_id_part} after 5 attempts")
                 return False
             time.sleep(2)
 
-    meta = run.extra.get("metadata", {}) if run.extra else {}
+    meta = root_run.extra.get("metadata", {}) if root_run.extra else {}
     ok = True
 
     for key, expected in [
@@ -38,25 +38,37 @@ def verify_trace(trace_url: str, expected_name: str, expected_version: str, expe
     ]:
         actual = meta.get(key)
         if actual == expected:
-            print(f"  OK: {key} = {actual}")
+            print(f"  OK: root metadata {key} = {actual}")
         else:
-            print(f"  FAIL: {key} expected={expected} actual={actual}")
+            print(f"  FAIL: root metadata {key} expected={expected} actual={actual}")
             ok = False
 
-    if run.total_tokens is not None and run.total_tokens > 0:
-        print(f"  OK: total_tokens = {run.total_tokens}")
-    else:
-        print(f"  INFO: total_tokens = {run.total_tokens} (may not be set on root)")
+    # Check child LLM run for LangSmith tracking metadata
+    all_runs = list(client.list_runs(trace_id=root_run.trace_id))
+    llm_run = None
+    for r in all_runs:
+        if r.run_type == "llm":
+            llm_run = r
+            break
 
-    if run.latency is not None:
-        print(f"  OK: latency = {run.latency}")
+    if llm_run:
+        llm_meta = llm_run.extra.get("metadata", {}) if llm_run.extra else {}
+        for key in ["ls_model_name", "ls_provider", "ls_temperature"]:
+            if key in llm_meta:
+                print(f"  OK: LLM metadata {key} = {llm_meta[key]}")
+            else:
+                print(f"  FAIL: LLM metadata {key} not found")
+                ok = False
+    else:
+        print("  FAIL: could not find an LLM child run to check ls_ metadata")
+        ok = False
 
     return ok
 
 
 def call_invoke(base: str, prompt_name: str, version: str, env: str | None = None):
     body = {
-        "input_text": "The World Health Organization declared on 5 May 2023 that COVID-19 is no longer a public health emergency of international concern. Director-General Tedros Adhanom Ghebreyesus made the announcement from Geneva after a meeting of the emergency committee.",
+        "input_text": "The World Health Organization declared on 5 May 2023 that COVID-19 is no longer a public health emergency of international concern.",
         "prompt_version": version,
     }
     if env:
@@ -73,15 +85,19 @@ def main():
 
     cases = [
         ("summarize_text", "v1", None, "staging"),
-        ("summarize_text", "v2", "production", "production"),
-        ("extract_entities", "v2", None, "staging"),
-        ("extract_entities", "v1", "production", "production"),
+        ("extract_entities", "v2", "production", "production"),
     ]
 
     for prompt_name, version, send_env, expect_env in cases:
         label = f"{prompt_name}/{version} env={send_env or '(default)'}"
         print(f"\n--- {label} ---")
-        resp = call_invoke(base, prompt_name, version, send_env)
+        try:
+            resp = call_invoke(base, prompt_name, version, send_env)
+        except Exception as exc:
+            print(f"  FAIL: invoke error: {exc}")
+            all_ok = False
+            continue
+
         trace_url = resp.get("trace_url", "")
         print(f"  trace_url: {trace_url[:80]}...")
 

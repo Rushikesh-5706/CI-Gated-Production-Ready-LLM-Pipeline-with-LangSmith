@@ -28,6 +28,9 @@ done
 HEALTH=$(curl -sf "$BASE/health")
 check "/health returns 200" "$([ -n "$HEALTH" ] && echo true || echo false)"
 
+PROMPTS=$(curl -sf "$BASE/prompts")
+check "/prompts returns 200" "$([ -n "$PROMPTS" ] && echo true || echo false)"
+
 # summarize_text v1
 RESP=$(curl -sf -X POST "$BASE/invoke/summarize_text" \
   -H "Content-Type: application/json" \
