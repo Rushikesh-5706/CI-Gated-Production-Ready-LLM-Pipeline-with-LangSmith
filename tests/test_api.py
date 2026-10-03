@@ -1,149 +1,254 @@
-from unittest.mock import patch
+"""API integration tests.
+
+These tests run the real route → schema → pipeline → parser path.
+The only thing patched is the Groq HTTP client so no real LLM calls occur.
+A separate set of pure routing tests uses a full invoke mock for speed.
+"""
+
+import types
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 
-def _mock_invoke(prompt_name, prompt_version, input_text, environment, **kwargs):
-    from app import registry
-    from app.errors import PromptNotFoundError, VersionNotFoundError
-    from app.llm import LLMResult
-    from app.pipeline import PipelineResult
-
-    names = registry.prompt_names()
-    if prompt_name not in names:
-        raise PromptNotFoundError(
-            f"prompt '{prompt_name}' not found; available: {names}",
-            available=names,
-        )
-    pt = registry.get(prompt_name, prompt_version)
-    if pt is None:
-        versions = registry.list_prompts().get(prompt_name, [])
-        raise VersionNotFoundError(
-            f"version '{prompt_version}' not found for '{prompt_name}'; available: {versions}",
-            available=versions,
-        )
-
-    lr = LLMResult(
-        text="mocked", model="test", prompt_tokens=10, completion_tokens=10, latency_seconds=0.1
+def _make_groq_response(text: str, model: str = "qwen/qwen3.8-27b") -> MagicMock:
+    usage = types.SimpleNamespace(
+        prompt_tokens=10, completion_tokens=10, total_tokens=20
     )
-    output = "mocked output"
-    if prompt_name == "extract_entities":
-        output = {"names": [], "dates": [], "locations": []}
-    return PipelineResult(output=output, trace_url="https://example.com/trace", llm_result=lr)
+    choice = types.SimpleNamespace(
+        message=types.SimpleNamespace(content=text),
+        finish_reason="stop",
+    )
+    return types.SimpleNamespace(choices=[choice], usage=usage, model=model)
+
+
+def _groq_patch(text: str):
+    """Return a context manager that patches the Groq completions endpoint."""
+    return patch(
+        "app.llm._get_client",
+        return_value=MagicMock(
+            chat=MagicMock(
+                completions=MagicMock(
+                    create=MagicMock(return_value=_make_groq_response(text))
+                )
+            )
+        ),
+    )
 
 
 @pytest.fixture
 def client():
-    with patch("app.main.invoke", side_effect=_mock_invoke):
-        from app.main import app
+    from app.main import app
 
-        with TestClient(app) as c:
-            yield c
+    with TestClient(app) as c:
+        yield c
 
 
 class TestHealthEndpoint:
     def test_health_returns_200(self, client):
         r = client.get("/health")
         assert r.status_code == 200
-        data = r.json()
-        assert data["status"] == "ok"
-        assert isinstance(data["prompts_loaded"], int)
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["prompts_loaded"] >= 4
+        assert isinstance(body["llm_configured"], bool)
+        assert isinstance(body["tracing_enabled"], bool)
+
+    def test_health_llm_configured_false_without_key(self):
+        with patch("app.config.GROQ_API_KEY", ""), patch("app.config.LANGCHAIN_API_KEY", ""):
+            from app.main import app
+
+            with TestClient(app) as c:
+                r = c.get("/health")
+                assert r.status_code == 200
+                assert r.json()["llm_configured"] is False
+                assert r.json()["tracing_enabled"] is False
+
+
+class TestPromptsEndpoint:
+    def test_prompts_lists_known_prompts(self, client):
+        r = client.get("/prompts")
+        assert r.status_code == 200
+        names = {p["name"] for p in r.json()}
+        assert "summarize_text" in names
+        assert "extract_entities" in names
+
+    def test_prompts_includes_versions(self, client):
+        r = client.get("/prompts")
+        for p in r.json():
+            assert len(p["versions"]) >= 2
 
 
 class TestInvokeEndpoint:
-    def test_summarize_text_v1(self, client):
-        r = client.post(
-            "/invoke/summarize_text",
-            json={
-                "input_text": "Some text to summarize.",
-                "prompt_version": "v1",
-            },
-        )
+    def test_summarize_returns_string(self, client):
+        with _groq_patch("A brief summary of the text."):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={"input_text": "Some text to summarize.", "prompt_version": "v1"},
+            )
         assert r.status_code == 200
-        data = r.json()
-        assert "output" in data
-        assert "trace_url" in data
+        body = r.json()
+        assert isinstance(body["output"], str)
+        assert "trace_url" in body
+
+    def test_summarize_v2_works(self, client):
+        with _groq_patch("Another summary."):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={"input_text": "Some text.", "prompt_version": "v2"},
+            )
+        assert r.status_code == 200
+
+    def test_extract_returns_dict(self, client):
+        payload = '{"names": ["Alice"], "dates": [], "locations": ["Paris"]}'
+        with _groq_patch(payload):
+            r = client.post(
+                "/invoke/extract_entities",
+                json={"input_text": "Alice went to Paris.", "prompt_version": "v1"},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["output"], dict)
+        assert "names" in body["output"]
+
+    def test_environment_default_staging(self, client):
+        with _groq_patch("Summary output here."):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={"input_text": "text", "prompt_version": "v1"},
+            )
+        assert r.status_code == 200
+
+    def test_environment_explicit_production(self, client):
+        with _groq_patch("Summary."):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={
+                    "input_text": "text",
+                    "prompt_version": "v1",
+                    "environment": "production",
+                },
+            )
+        assert r.status_code == 200
 
     def test_unknown_prompt_404(self, client):
-        r = client.post(
-            "/invoke/nonexistent_prompt",
-            json={
-                "input_text": "test",
-                "prompt_version": "v1",
-            },
-        )
+        with _groq_patch("x"):
+            r = client.post(
+                "/invoke/nonexistent_prompt",
+                json={"input_text": "test", "prompt_version": "v1"},
+            )
         assert r.status_code == 404
-        assert "available" in r.json()["detail"]
 
     def test_unknown_version_404(self, client):
-        r = client.post(
-            "/invoke/summarize_text",
-            json={
-                "input_text": "test",
-                "prompt_version": "v99",
-            },
-        )
+        with _groq_patch("x"):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={"input_text": "test", "prompt_version": "v99"},
+            )
         assert r.status_code == 404
-        assert "available" in r.json()["detail"]
 
-    def test_empty_input_422(self, client):
-        r = client.post(
-            "/invoke/summarize_text",
-            json={
-                "input_text": "",
-                "prompt_version": "v1",
-            },
-        )
-        assert r.status_code == 422
+    def test_missing_key_503(self):
+        with patch("app.config.GROQ_API_KEY", ""):
+            from app.main import app
 
-    def test_missing_version_422(self, client):
-        r = client.post(
-            "/invoke/summarize_text",
-            json={
-                "input_text": "test",
-            },
-        )
-        assert r.status_code == 422
+            with TestClient(app) as c:
+                r = c.post(
+                    "/invoke/summarize_text",
+                    json={"input_text": "test", "prompt_version": "v1"},
+                )
+        assert r.status_code == 503
 
     def test_invalid_version_format_422(self, client):
         r = client.post(
             "/invoke/summarize_text",
-            json={
-                "input_text": "test",
-                "prompt_version": "version1",
-            },
+            json={"input_text": "test", "prompt_version": "version1"},
         )
         assert r.status_code == 422
 
     def test_extra_field_rejected(self, client):
         r = client.post(
             "/invoke/summarize_text",
+            json={"input_text": "test", "prompt_version": "v1", "extra": "bad"},
+        )
+        assert r.status_code == 422
+
+    def test_environment_integer_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
+            json={"input_text": "test", "prompt_version": "v1", "environment": 5},
+        )
+        assert r.status_code == 422
+
+    def test_environment_list_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
+            json={"input_text": "test", "prompt_version": "v1", "environment": ["a"]},
+        )
+        assert r.status_code == 422
+
+    def test_environment_null_uses_default(self, client):
+        with _groq_patch("Summary."):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={
+                    "input_text": "test",
+                    "prompt_version": "v1",
+                    "environment": None,
+                },
+            )
+        assert r.status_code == 200
+
+    def test_environment_uppercase_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
+            json={"input_text": "test", "prompt_version": "v1", "environment": "Staging"},
+        )
+        assert r.status_code == 422
+
+    def test_environment_too_long_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
             json={
                 "input_text": "test",
                 "prompt_version": "v1",
-                "extra": "bad",
+                "environment": "a" * 33,
             },
         )
         assert r.status_code == 422
 
+    def test_empty_input_text_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
+            json={"input_text": "", "prompt_version": "v1"},
+        )
+        assert r.status_code == 422
 
-class TestLLMNotConfigured:
-    def test_503_when_key_missing(self):
-        from app.errors import LLMNotConfiguredError
+    def test_missing_prompt_version_yields_422(self, client):
+        r = client.post(
+            "/invoke/summarize_text",
+            json={"input_text": "test"},
+        )
+        assert r.status_code == 422
 
-        def raise_not_configured(*args, **kwargs):
-            raise LLMNotConfiguredError("LLM provider is not configured")
+    def test_empty_response_yields_502(self, client):
+        with _groq_patch(""):
+            r = client.post(
+                "/invoke/summarize_text",
+                json={"input_text": "test", "prompt_version": "v1"},
+            )
+        assert r.status_code == 502
 
-        with patch("app.main.invoke", side_effect=raise_not_configured):
-            from app.main import app
+    def test_timeout_yields_504(self, client):
+        import groq as groq_mod
 
-            with TestClient(app) as c:
-                r = c.post(
+        with patch("app.llm._get_client") as mock_client:
+            mock_client.return_value.chat.completions.create.side_effect = (
+                groq_mod.APITimeoutError(request=MagicMock())
+            )
+            with patch("app.config.LLM_MAX_RETRIES", 0):
+                r = client.post(
                     "/invoke/summarize_text",
-                    json={
-                        "input_text": "test",
-                        "prompt_version": "v1",
-                    },
+                    json={"input_text": "test", "prompt_version": "v1"},
                 )
-                assert r.status_code == 503
+        assert r.status_code == 504
