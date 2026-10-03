@@ -1,28 +1,23 @@
-import re
+from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class InvokeRequest(BaseModel, extra="forbid"):
     input_text: str = Field(..., min_length=1, max_length=20000)
     prompt_version: str = Field(..., pattern=r"^v[0-9]+$")
-    environment: str | None = Field(default=None, min_length=1, max_length=32)
+    # Typed field with a regex constraint: Pydantic validates the type first,
+    # so a non-string value (int, list, null) yields 422 before the pattern check.
+    environment: Annotated[
+        str,
+        StringConstraints(pattern=r"^[a-z0-9_-]+$", min_length=1, max_length=32),
+    ] | None = Field(default=None)
 
-    @field_validator("input_text", mode="before")
-    @classmethod
-    def strip_input(cls, v: str) -> str:
-        if isinstance(v, str):
-            return v.strip()
-        return v
+    @staticmethod
+    def _strip(v: str) -> str:
+        return v.strip()
 
-    @field_validator("environment", mode="before")
-    @classmethod
-    def validate_environment(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        if not re.match(r"^[a-z0-9_-]{1,32}$", v):
-            raise ValueError("environment must match [a-z0-9_-] and be 1-32 chars")
-        return v
+    model_config = {"str_strip_whitespace": True}
 
 
 class InvokeResponse(BaseModel):
