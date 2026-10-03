@@ -1,6 +1,13 @@
-import json
+"""Post or update a pull-request comment with the regression report.
+
+Usage:
+    python -m evaluation.pr_comment --report results/report.md
+"""
+
+import argparse
 import logging
 import os
+import sys
 
 import requests
 
@@ -14,11 +21,40 @@ def _get_pr_number() -> int | None:
     if not event_path:
         return None
     try:
+        import json
+
         with open(event_path) as f:
             event = json.load(f)
         return event.get("pull_request", {}).get("number")
-    except (OSError, json.JSONDecodeError, KeyError):
+    except (OSError, ValueError, KeyError):
         return None
+
+
+def _list_all_comments(api: str, headers: dict) -> list[dict]:
+    """Page through all PR comments; GitHub returns 30 per page by default."""
+    comments: list[dict] = []
+    url = f"{api}?per_page=100&page=1"
+    page = 1
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        comments.extend(batch)
+        page += 1
+        link_header = resp.headers.get("Link", "")
+        if 'rel="next"' in link_header:
+            # Parse next URL from Link header.
+            for part in link_header.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+            else:
+                break
+        else:
+            break
+    return comments
 
 
 def upsert_comment(report: str) -> None:
@@ -29,10 +65,15 @@ def upsert_comment(report: str) -> None:
     if not pr_number:
         pr_ref = os.environ.get("PR_NUMBER", "")
         if pr_ref:
-            pr_number = int(pr_ref)
+            try:
+                pr_number = int(pr_ref)
+            except ValueError:
+                pass
 
     if not token or not repo or not pr_number:
-        log.warning("missing GITHUB_TOKEN, GITHUB_REPOSITORY, or PR number; skipping comment")
+        log.warning(
+            "missing GITHUB_TOKEN, GITHUB_REPOSITORY, or PR number; skipping comment"
+        )
         _write_step_summary(report)
         return
 
@@ -43,9 +84,7 @@ def upsert_comment(report: str) -> None:
     }
 
     try:
-        resp = requests.get(api, headers=headers, timeout=30)
-        resp.raise_for_status()
-        comments = resp.json()
+        comments = _list_all_comments(api, headers)
     except requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 403:
             log.warning(
@@ -85,3 +124,42 @@ def _write_step_summary(report: str) -> None:
         log.info("report appended to GITHUB_STEP_SUMMARY")
     else:
         print(report)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(
+        description="Post or update a PR comment with the regression report."
+    )
+    parser.add_argument(
+        "--report",
+        required=True,
+        help="path to the report markdown file",
+    )
+    args = parser.parse_args()
+
+    from pathlib import Path
+
+    report_path = Path(args.report)
+    if not report_path.exists():
+        run_url = ""
+        gh_server = os.environ.get("GITHUB_SERVER_URL", "")
+        gh_repo = os.environ.get("GITHUB_REPOSITORY", "")
+        gh_run = os.environ.get("GITHUB_RUN_ID", "")
+        if gh_server and gh_repo and gh_run:
+            run_url = f"{gh_server}/{gh_repo}/actions/runs/{gh_run}"
+        notice = (
+            f"{MARKER}\n\nStatus: FAILED\n\n"
+            f"  - report file not found: {args.report}\n"
+        )
+        if run_url:
+            notice += f"\nSee the run log for details: {run_url}\n"
+        upsert_comment(notice)
+        sys.exit(1)
+
+    report = report_path.read_text()
+    upsert_comment(report)
+
+
+if __name__ == "__main__":
+    main()

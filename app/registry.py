@@ -4,11 +4,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.errors import PromptNotFoundError, VersionNotFoundError
+
 log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 VERSION_RE = re.compile(r"^v(\d+)$")
 ALLOWED_TOP_KEYS = {"template", "changelog", "model_parameters"}
+# Both prompts are required to exist with at least one version at startup.
+REQUIRED_PROMPTS = {"summarize_text", "extract_entities"}
 
 
 @dataclass(frozen=True)
@@ -48,11 +52,14 @@ def _validate_and_load(path: Path, name: str, version: str) -> PromptTemplate:
     if not isinstance(changelog, str) or not changelog.strip():
         raise ValueError(f"{path}: 'changelog' must be a non-empty string")
 
-    params = data.get("model_parameters", {})
+    params = data.get("model_parameters")
     if not isinstance(params, dict):
-        raise ValueError(f"{path}: 'model_parameters' must be an object")
+        raise ValueError(f"{path}: 'model_parameters' is required and must be an object")
 
-    temp = params.get("temperature", 0.7)
+    # temperature is required per the contract schema.
+    if "temperature" not in params:
+        raise ValueError(f"{path}: 'model_parameters.temperature' is required")
+    temp = params["temperature"]
     if not isinstance(temp, (int, float)) or temp < 0 or temp > 2:
         raise ValueError(f"{path}: temperature must be a number between 0 and 2")
 
@@ -94,16 +101,28 @@ def load_all() -> None:
         vers.sort(key=lambda x: x[0])
         _versions[name] = [v for _, v in vers]
 
+    missing = REQUIRED_PROMPTS - set(_versions.keys())
+    if missing:
+        raise RuntimeError(f"required prompts missing at startup: {sorted(missing)}")
+
     total = len(_cache)
     log.info("loaded %d prompt templates across %d prompts", total, len(_versions))
 
 
 def get(name: str, version: str) -> PromptTemplate:
-    key = (name, version)
+    """Return the named prompt template or raise a typed error."""
     if name not in _versions:
-        return None  # type: ignore[return-value]
+        raise PromptNotFoundError(
+            f"prompt {name!r} not found; available: {list(_versions)}",
+            available=list(_versions),
+        )
+    key = (name, version)
     if key not in _cache:
-        return None  # type: ignore[return-value]
+        available = _versions.get(name, [])
+        raise VersionNotFoundError(
+            f"version {version!r} not found for prompt {name!r}; available: {available}",
+            available=available,
+        )
     return _cache[key]
 
 
@@ -123,10 +142,11 @@ def prompt_names() -> list[str]:
 
 
 def get_changelog(name: str, version: str) -> str:
-    pt = get(name, version)
-    if pt is None:
+    try:
+        pt = get(name, version)
+        return pt.changelog
+    except Exception:
         return ""
-    return pt.changelog
 
 
 def render(pt: PromptTemplate, input_text: str) -> str:

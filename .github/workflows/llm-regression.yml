@@ -37,8 +37,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt -r requirements-dev.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Verify secrets
         run: |
@@ -61,12 +60,19 @@ jobs:
         id: evaluate
         run: python -m evaluation.run_regression --output-dir results
 
-      - name: Post PR comment
+      - name: Append report to step summary
         if: always()
+        run: |
+          if [ -f results/report.md ]; then
+            cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python -c "from evaluation.pr_comment import upsert_comment; from pathlib import Path; r=Path('results/report.md'); upsert_comment(r.read_text() if r.exists() else 'Evaluation failed to produce a report. Check the workflow run logs.')"
+        run: python -m evaluation.pr_comment --report results/report.md
 
       - name: Upload results
         if: always()

@@ -1,12 +1,15 @@
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import config, registry
 from app.errors import (
+    LLMEmptyResponseError,
     LLMNotConfiguredError,
     LLMRateLimitError,
     LLMTimeoutError,
@@ -17,44 +20,72 @@ from app.errors import (
 from app.pipeline import invoke
 from app.schemas import HealthResponse, InvokeRequest, InvokeResponse, PromptInfo
 
-log = logging.getLogger(__name__)
-
-app = FastAPI(title="CI-Gated LLM Pipeline")
+_request_id: ContextVar[str] = ContextVar("request_id", default="-")
 
 
-@app.on_event("startup")
-def startup() -> None:
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id.get()
+        return True
+
+
+def _setup_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.addFilter(_RequestIdFilter())
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s",
+        handlers=[handler],
+        force=True,
     )
+
+
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _setup_logging()
     registry.load_all()
+    yield
+
+
+app = FastAPI(title="CI-Gated LLM Pipeline", lifespan=lifespan)
 
 
 @app.middleware("http")
 async def request_logging(request: Request, call_next):
-    request_id = str(uuid.uuid4())[:8]
+    req_id = str(uuid.uuid4())[:8]
+    token = _request_id.set(req_id)
     t0 = time.monotonic()
-    response = await call_next(request)
-    elapsed = time.monotonic() - t0
-    log.info(
-        "%s %s %d %.3fs req=%s",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed,
-        request_id,
-    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        log.exception("unhandled error in request")
+        raise
+    finally:
+        elapsed = time.monotonic() - t0
+        log.info(
+            "%s %s %d %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code if "response" in dir() else 500,
+            elapsed,
+        )
+        _request_id.reset(token)
     return response
 
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
+    tracing_on = (
+        config.LANGCHAIN_TRACING_V2.lower() == "true" and bool(config.LANGCHAIN_API_KEY)
+    )
     return HealthResponse(
         status="ok",
         prompts_loaded=registry.count(),
         llm_configured=bool(config.GROQ_API_KEY),
-        tracing_enabled=config.LANGCHAIN_TRACING_V2.lower() == "true",
+        tracing_enabled=tracing_on,
     )
 
 
@@ -72,13 +103,12 @@ def list_prompts() -> list[PromptInfo]:
 @app.post("/invoke/{prompt_name}", response_model=InvokeResponse)
 def invoke_prompt(prompt_name: str, body: InvokeRequest) -> InvokeResponse:
     environment = body.environment or config.DEFAULT_ENVIRONMENT
-    input_len = len(body.input_text)
     log.info(
         "invoke prompt=%s version=%s env=%s input_len=%d",
         prompt_name,
         body.prompt_version,
         environment,
-        input_len,
+        len(body.input_text),
     )
 
     result = invoke(
@@ -93,26 +123,21 @@ def invoke_prompt(prompt_name: str, body: InvokeRequest) -> InvokeResponse:
 
 @app.exception_handler(PromptNotFoundError)
 async def handle_prompt_not_found(request: Request, exc: PromptNotFoundError) -> JSONResponse:
-    return JSONResponse(
-        status_code=404,
-        content={"detail": str(exc)},
-    )
+    log.info("prompt not found: %s", exc)
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
 @app.exception_handler(VersionNotFoundError)
 async def handle_version_not_found(request: Request, exc: VersionNotFoundError) -> JSONResponse:
-    return JSONResponse(
-        status_code=404,
-        content={"detail": str(exc)},
-    )
+    log.info("version not found: %s", exc)
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
 
 
 @app.exception_handler(LLMNotConfiguredError)
-async def handle_llm_not_configured(request: Request, exc: LLMNotConfiguredError) -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        content={"detail": str(exc)},
-    )
+async def handle_llm_not_configured(
+    request: Request, exc: LLMNotConfiguredError
+) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.exception_handler(LLMRateLimitError)
@@ -129,24 +154,21 @@ async def handle_rate_limit(request: Request, exc: LLMRateLimitError) -> JSONRes
 
 @app.exception_handler(LLMTimeoutError)
 async def handle_timeout(request: Request, exc: LLMTimeoutError) -> JSONResponse:
-    return JSONResponse(
-        status_code=504,
-        content={"detail": "upstream LLM request timed out"},
-    )
+    return JSONResponse(status_code=504, content={"detail": "upstream LLM request timed out"})
+
+
+@app.exception_handler(LLMEmptyResponseError)
+async def handle_empty_response(request: Request, exc: LLMEmptyResponseError) -> JSONResponse:
+    log.warning("empty response from model: %s", exc)
+    return JSONResponse(status_code=502, content={"detail": "model returned empty response"})
 
 
 @app.exception_handler(LLMUpstreamError)
 async def handle_upstream(request: Request, exc: LLMUpstreamError) -> JSONResponse:
-    return JSONResponse(
-        status_code=502,
-        content={"detail": "upstream LLM error"},
-    )
+    return JSONResponse(status_code=502, content={"detail": "upstream LLM error"})
 
 
 @app.exception_handler(Exception)
 async def handle_generic(request: Request, exc: Exception) -> JSONResponse:
     log.exception("unhandled error")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "internal server error"},
-    )
+    return JSONResponse(status_code=500, content={"detail": "internal server error"})

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from langsmith import get_current_run_tree, traceable
 
 from app import config, registry
-from app.errors import PromptNotFoundError, VersionNotFoundError
 from app.llm import LLMResult, chat_completion
 from app.parsing import parse_entities, parse_summary
 
@@ -34,31 +33,23 @@ def execute(
     prompt_name: str,
     prompt_version: str,
     input_text: str,
-    environment: str,
 ) -> PipelineResult:
-    names = registry.prompt_names()
-    if prompt_name not in names:
-        raise PromptNotFoundError(
-            f"prompt '{prompt_name}' not found; available: {names}",
-            available=names,
-        )
-
+    # registry.get raises PromptNotFoundError or VersionNotFoundError if absent.
     pt = registry.get(prompt_name, prompt_version)
-    if pt is None:
-        versions = registry.list_prompts().get(prompt_name, [])
-        raise VersionNotFoundError(
-            f"version '{prompt_version}' not found for '{prompt_name}'; available: {versions}",
-            available=versions,
-        )
 
     rendered = _render(pt, input_text)
     max_tokens = config.PROMPT_MAX_TOKENS.get(prompt_name, config.DEFAULT_MAX_TOKENS)
+
+    response_format: dict | None = None
+    if prompt_name == "extract_entities":
+        response_format = {"type": "json_object"}
 
     llm_out = chat_completion(
         prompt=rendered,
         model=config.LLM_MODEL,
         temperature=pt.temperature,
         max_tokens=max_tokens,
+        response_format=response_format,
     )
     llm_result: LLMResult = llm_out["result"]
 
@@ -84,14 +75,14 @@ def invoke(
         rt.add_metadata(metadata)
         rt.add_tags([prompt_name, prompt_version, environment])
 
-    result = execute(prompt_name, prompt_version, input_text, environment)
+    result = execute(prompt_name, prompt_version, input_text)
 
     trace_url = ""
     if rt:
         try:
             trace_url = rt.get_url()
         except Exception:
-            log.exception("failed to obtain trace URL")
+            log.warning("tracing disabled; trace_url will be empty")
 
     result.trace_url = trace_url
     return result

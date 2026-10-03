@@ -4,9 +4,16 @@ import time
 from dataclasses import dataclass
 
 import groq
-from langsmith import traceable
+from langsmith import get_current_run_tree, traceable
 
 from app import config
+from app.errors import (
+    LLMEmptyResponseError,
+    LLMNotConfiguredError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMUpstreamError,
+)
 from app.limiter import get_limiter
 
 log = logging.getLogger(__name__)
@@ -50,16 +57,16 @@ def chat_completion(
     model: str,
     temperature: float,
     max_tokens: int,
+    system_prompt: str | None = None,
     response_format: dict | None = None,
 ) -> dict:
-    """Single LLM call with rate limiting and retries. Returns a dict for LangSmith tracing."""
-    from app.errors import (
-        LLMNotConfiguredError,
-        LLMRateLimitError,
-        LLMTimeoutError,
-        LLMUpstreamError,
-    )
+    """Single LLM call with rate limiting and retries.
 
+    Returns a dict shaped for LangSmith tracing.  Model identity and provider
+    are written into run *metadata* (not outputs) so LangSmith can attribute
+    the model and cost.  ``usage_metadata`` stays in outputs as the SDK reads
+    it for token reporting.
+    """
     if not config.GROQ_API_KEY:
         raise LLMNotConfiguredError("LLM provider is not configured")
 
@@ -68,9 +75,14 @@ def chat_completion(
     estimated = _estimate_tokens(prompt, max_tokens)
     limiter.wait_for_capacity(estimated)
 
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     kwargs: dict = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
@@ -90,10 +102,33 @@ def chat_completion(
 
             limiter.reconcile_tokens(estimated, total_tok)
 
-            text = resp.choices[0].message.content or ""
+            text = (resp.choices[0].message.content or "").strip()
+
+            if not text:
+                raise LLMEmptyResponseError(
+                    f"model {model!r} returned empty content "
+                    f"(finish_reason={resp.choices[0].finish_reason!r})"
+                )
+
+            if "<think>" in text:
+                raise LLMEmptyResponseError(
+                    f"model {model!r} returned unstripped reasoning block"
+                )
 
             if _usage_callback:
                 _usage_callback(model, prompt_tok, comp_tok)
+
+            # Write model identity to run metadata so LangSmith can attribute
+            # model and cost.  This must happen after a successful response.
+            run_tree = get_current_run_tree()
+            if run_tree is not None:
+                run_tree.add_metadata(
+                    {
+                        "ls_provider": "groq",
+                        "ls_model_name": model,
+                        "ls_temperature": temperature,
+                    }
+                )
 
             return {
                 "result": LLMResult(
@@ -108,10 +143,13 @@ def chat_completion(
                     "output_tokens": comp_tok,
                     "total_tokens": total_tok,
                 },
-                "ls_provider": "groq",
-                "ls_model_name": model,
-                "ls_temperature": temperature,
             }
+
+        except LLMEmptyResponseError:
+            raise
+
+        except LLMNotConfiguredError:
+            raise
 
         except groq.RateLimitError as exc:
             last_exc = exc

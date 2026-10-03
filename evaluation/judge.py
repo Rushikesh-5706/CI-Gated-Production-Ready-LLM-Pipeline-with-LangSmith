@@ -9,11 +9,21 @@ from evaluation.config import EVALUATOR_JUDGE
 
 log = logging.getLogger(__name__)
 
-JUDGE_PROMPT = """You are an expert quality assessor. Your task is to evaluate a generated summary based on the original text.
-Original Text: {original_text}
-Generated Summary: {generated_summary}
+JUDGE_SYSTEM = (
+    "You are an expert quality assessor evaluating AI-generated summaries. "
+    "Respond only with a single JSON object."
+)
 
-Please evaluate the summary on two criteria: Relevance and Conciseness. Provide a score from 1 to 5 for each, where 1 is the worst and 5 is the best. Output your response as a single JSON object with the keys 'relevance_score', 'conciseness_score', and 'justification'. Respond with the JSON object and nothing else."""
+JUDGE_PROMPT = (
+    "Evaluate the summary below against the original text.\n\n"
+    "Original text:\n{original_text}\n\n"
+    "Generated summary:\n{generated_summary}\n\n"
+    "Return a JSON object with exactly these keys:\n"
+    '  "relevance_score": integer 1-5 (how well the summary captures the main points)\n'
+    '  "conciseness_score": integer 1-5 (how concise and free of padding the summary is)\n'
+    '  "justification": string (one sentence explaining the scores)\n'
+    "Do not include any text outside the JSON object."
+)
 
 
 def _call_judge(original_text: str, summary: str) -> dict | None:
@@ -23,9 +33,10 @@ def _call_judge(original_text: str, summary: str) -> dict | None:
 
     result = chat_completion(
         prompt=prompt,
+        system_prompt=JUDGE_SYSTEM,
         model=config.JUDGE_MODEL,
         temperature=0,
-        max_tokens=256,
+        max_tokens=config.JUDGE_MAX_TOKENS,
         response_format={"type": "json_object"},
     )
     llm_result = result["result"]
@@ -39,7 +50,7 @@ def _call_judge(original_text: str, summary: str) -> dict | None:
     rel = parsed.get("relevance_score")
     con = parsed.get("conciseness_score")
 
-    if not isinstance(rel, int) or not isinstance(con, int):
+    if not isinstance(rel, (int, float)) or not isinstance(con, (int, float)):
         return None
     if not (1 <= rel <= 5) or not (1 <= con <= 5):
         return None
@@ -84,7 +95,7 @@ def llm_as_judge_quality(run: Run, example: Example) -> dict:
                 )
                 return {"key": EVALUATOR_JUDGE, "score": score, "comment": comment}
         except Exception as exc:
-            log.warning("Judge evaluator failed: %s", exc)
+            log.warning("judge evaluator failed on attempt %d: %s", _attempt + 1, exc)
 
     return {
         "key": EVALUATOR_JUDGE,
